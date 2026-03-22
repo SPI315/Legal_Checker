@@ -5,6 +5,7 @@ from app.services.anonymization.anonymizer import AnonymizerService
 from app.services.anonymization.regex_detector import RegexDetector
 from app.services.anonymization.span_resolver import SpanResolver
 from app.services.anonymization.transformer_detector import TransformerNerDetector
+from app.services.documents.ingestion_service import DocumentIngestionService
 
 
 def get_anonymizer_service(settings: Settings = Depends(get_settings)) -> AnonymizerService:
@@ -16,3 +17,10 @@ def get_anonymizer_service(settings: Settings = Depends(get_settings)) -> Anonym
     )
     resolver = SpanResolver()
     return AnonymizerService(regex_detector, ner_detector, resolver)
+
+
+def get_document_ingestion_service(
+    settings: Settings = Depends(get_settings),
+) -> DocumentIngestionService:
+    _ = settings
+    return DocumentIngestionService()

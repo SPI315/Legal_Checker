@@ -65,7 +65,9 @@ class TransformerNerDetector:
             if score < self.min_score:
                 continue
 
-            raw_entity = str(pred.get("entity_group", "")).upper()
+            raw_entity = self._normalize_label(
+                str(pred.get("entity_group") or pred.get("entity") or "").upper()
+            )
             mapped = self.entity_mapping.get(raw_entity)
             if not mapped:
                 continue
@@ -86,3 +88,19 @@ class TransformerNerDetector:
             )
 
         return spans
+
+    def _normalize_label(self, label: str) -> str:
+        if not label:
+            return ""
+
+        # Common token-level prefixes in NER tags.
+        for prefix in ("B-", "I-", "L-", "U-", "S-", "E-"):
+            if label.startswith(prefix):
+                return label[len(prefix) :]
+
+        # Some models output underscore variants like B_PER.
+        for prefix in ("B_", "I_", "L_", "U_", "S_", "E_"):
+            if label.startswith(prefix):
+                return label[len(prefix) :]
+
+        return label

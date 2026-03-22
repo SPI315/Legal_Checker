@@ -9,7 +9,7 @@ class Settings(BaseSettings):
     ner_device: int = -1
     ner_min_score: float = 0.6
 
-    model_config = SettingsConfigDict(env_file=".env", env_prefix="LEGAL_")
+    model_config = SettingsConfigDict(env_file=".env", env_prefix="LEGAL_", extra="ignore")
 
 
 @lru_cache
