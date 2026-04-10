@@ -1,7 +1,7 @@
 from dataclasses import asdict
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, File, HTTPException, Response, UploadFile
+from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, Response, UploadFile
 
 from app.api.deps import get_document_ingestion_service, get_pipeline_orchestrator
 from app.schemas.documents import ParseDocumentResponse, ParsedParagraph
@@ -13,13 +13,16 @@ from app.schemas.pipeline import (
     ObservabilityResponse,
     PipelineEventResponse,
     ProcessDocumentResponse,
+    StartProcessResponse,
     StageStatusResponse,
+    TimelineEntryResponse,
 )
 from app.services.documents.ingestion_service import (
     DocumentIngestionService,
     UnsupportedDocumentTypeError,
 )
 from app.services.orchestration.orchestrator import PipelineOrchestrator
+from uuid import uuid4
 
 router = APIRouter(prefix="/api", tags=["documents"])
 ALLOWED_MIME_TYPES = {
@@ -81,6 +84,40 @@ async def process_document(
     return _build_process_response(result)
 
 
+@router.post("/documents/process/start", response_model=StartProcessResponse)
+async def start_process_document(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    jurisdiction: str = "RU",
+    use_ner: bool = True,
+    orchestrator: PipelineOrchestrator = Depends(get_pipeline_orchestrator),
+) -> StartProcessResponse:
+    _validate_uploaded_file(file)
+    content = await file.read()
+    if not content:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty")
+
+    session_id = str(uuid4())
+    file_name = file.filename or "uploaded_file"
+    orchestrator.initialize_session(session_id, file_name)
+    background_tasks.add_task(
+        orchestrator.process_with_session,
+        session_id=session_id,
+        file_name=file_name,
+        content=content,
+        jurisdiction=jurisdiction,
+        use_ner=use_ner,
+    )
+    status = orchestrator.get_status(session_id)
+    return StartProcessResponse(
+        session_id=session_id,
+        status=status.status if status else "queued",
+        current_stage=status.current_stage if status else "INIT",
+        file_name=file_name,
+        file_type=status.file_type if status else "unknown",
+    )
+
+
 @router.get("/documents/{session_id}", response_model=ProcessDocumentResponse)
 def get_processed_document(
     session_id: str,
@@ -128,6 +165,35 @@ def export_processed_document(
         media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         headers=headers,
     )
+
+
+@router.get("/documents/{session_id}/timeline", response_model=list[TimelineEntryResponse])
+def get_document_timeline(
+    session_id: str,
+    orchestrator: PipelineOrchestrator = Depends(get_pipeline_orchestrator),
+) -> list[TimelineEntryResponse]:
+    timeline = orchestrator.get_timeline(session_id)
+    if timeline is None:
+        raise HTTPException(status_code=404, detail="Session timeline not found")
+
+    return [
+        TimelineEntryResponse(
+            timestamp=item["timestamp"],
+            level=item.get("level", "INFO"),
+            event_type=item["event_type"],
+            provider=item.get("provider"),
+            stage=item.get("stage"),
+            candidate_id=item.get("candidate_id"),
+            message=item.get("message", ""),
+            query=item.get("query"),
+            evidence_count=item.get("evidence_count"),
+            fallback_used=item.get("fallback_used"),
+            status=item.get("status"),
+            findings=item.get("findings"),
+            degraded_flags=item.get("degraded_flags"),
+        )
+        for item in timeline
+    ]
 
 
 def _build_process_response(result) -> ProcessDocumentResponse:

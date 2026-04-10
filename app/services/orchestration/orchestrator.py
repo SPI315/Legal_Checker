@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import json
 import logging
 from dataclasses import asdict
 from datetime import UTC, datetime
+from pathlib import Path
 from uuid import uuid4
 
 from app.services.anonymization.anonymizer import AnonymizerService
@@ -12,6 +14,7 @@ from app.services.llm.client import RiskLlmAnalyzer
 from app.services.ocr.stub import OcrStubService
 from app.services.orchestration.state_store import InMemoryPipelineStateStore
 from app.services.orchestration.types import (
+    EvidenceItem,
     Finding,
     PipelineArtifacts,
     PipelineEvent,
@@ -28,6 +31,9 @@ from app.services.validation.policy_validator import PolicyValidator
 from app.services.validation.report_validator import ReportValidator
 
 logger = logging.getLogger(__name__)
+
+MIN_EVIDENCE_COUNT = 2
+MIN_RETRIEVAL_SCORE = 0.35
 
 
 class PipelineOrchestrator:
@@ -61,6 +67,44 @@ class PipelineOrchestrator:
 
     def process(self, file_name: str, content: bytes, jurisdiction: str = "RU", use_ner: bool = True) -> PipelineResult:
         session_id = str(uuid4())
+        self.initialize_session(session_id, file_name)
+        return self.process_with_session(
+            session_id=session_id,
+            file_name=file_name,
+            content=content,
+            jurisdiction=jurisdiction,
+            use_ner=use_ner,
+        )
+
+    def initialize_session(self, session_id: str, file_name: str) -> None:
+        self._update_status(
+            session_id=session_id,
+            status="queued",
+            current_stage="INIT",
+            file_name=file_name,
+            file_type="unknown",
+            degraded_flags=[],
+            last_event=None,
+        )
+        self._append_session_log(
+            session_id,
+            {
+                "timestamp": datetime.now(UTC).isoformat(),
+                "level": "INFO",
+                "event_type": "session_queued",
+                "provider": "system",
+                "message": "Session queued for processing",
+            },
+        )
+
+    def process_with_session(
+        self,
+        session_id: str,
+        file_name: str,
+        content: bytes,
+        jurisdiction: str = "RU",
+        use_ner: bool = True,
+    ) -> PipelineResult:
         degraded_flags: list[str] = []
         stages: list[StageExecution] = []
         observability = PipelineObservability()
@@ -133,127 +177,14 @@ class PipelineOrchestrator:
 
         findings: list[Finding] = []
         for candidate in candidates:
-            logger.info(
-                "session_id=%s candidate_id=%s candidate_processing_started risk_type=%s paragraph_id=%s",
-                session_id,
-                candidate.candidate_id,
-                candidate.risk_type,
-                candidate.paragraph_id,
+            finding = self._process_candidate(
+                session_id=session_id,
+                candidate=candidate,
+                jurisdiction=jurisdiction,
+                observability=observability,
+                degraded_flags=degraded_flags,
             )
-            query = self.query_builder.build(candidate, jurisdiction)
-            retrieval_result = self.retriever.retrieve(query)
-            evidence = retrieval_result.evidence
-            observability.retrieval_provider = retrieval_result.provider_used
-            observability.retrieval_fallback_used = (
-                observability.retrieval_fallback_used or retrieval_result.fallback_used
-            )
-            observability.events.append(
-                PipelineEvent(
-                    timestamp=datetime.now(UTC).isoformat(),
-                    event_type="retrieval",
-                    provider=retrieval_result.provider_used,
-                    detail=f"Retrieved {len(evidence)} evidence items for {candidate.candidate_id}",
-                )
-            )
-            self._append_session_log(
-                session_id,
-                {
-                    "timestamp": datetime.now(UTC).isoformat(),
-                    "level": "INFO",
-                    "event_type": "retrieval",
-                    "provider": retrieval_result.provider_used,
-                    "candidate_id": candidate.candidate_id,
-                    "message": f"Retrieved {len(evidence)} evidence items",
-                },
-            )
-            if retrieval_result.fallback_used:
-                degraded_flags.append("tavily_failed_fallback_used")
-                logger.warning(
-                    "session_id=%s candidate_id=%s retrieval_fallback_used provider=%s",
-                    session_id,
-                    candidate.candidate_id,
-                    retrieval_result.provider_used,
-                )
-            else:
-                logger.info(
-                    "session_id=%s candidate_id=%s retrieval_completed provider=%s evidence_count=%s",
-                    session_id,
-                    candidate.candidate_id,
-                    retrieval_result.provider_used,
-                    len(evidence),
-                )
-
-            analysis = self.llm_analyzer.analyze(candidate, evidence)
-            observability.llm_provider = analysis.provider_used
-            observability.llm_fallback_used = observability.llm_fallback_used or analysis.fallback_used
-            observability.llm_prompt_tokens += analysis.prompt_tokens
-            observability.llm_completion_tokens += analysis.completion_tokens
-            observability.llm_cost_estimate = round(
-                observability.llm_cost_estimate + analysis.cost_estimate,
-                6,
-            )
-            observability.events.append(
-                PipelineEvent(
-                    timestamp=datetime.now(UTC).isoformat(),
-                    event_type="llm_analysis",
-                    provider=analysis.provider_used,
-                    detail=f"Analyzed candidate {candidate.candidate_id}",
-                )
-            )
-            self._append_session_log(
-                session_id,
-                {
-                    "timestamp": datetime.now(UTC).isoformat(),
-                    "level": "INFO",
-                    "event_type": "llm_analysis",
-                    "provider": analysis.provider_used,
-                    "candidate_id": candidate.candidate_id,
-                    "message": "Analyzed candidate",
-                    "prompt_tokens": analysis.prompt_tokens,
-                    "completion_tokens": analysis.completion_tokens,
-                    "cost_estimate": analysis.cost_estimate,
-                },
-            )
-            if analysis.provider_used == "vllm":
-                degraded_flags.append("openrouter_failed_vllm_used")
-                logger.warning(
-                    "session_id=%s candidate_id=%s llm_fallback_to_vllm prompt_tokens=%s completion_tokens=%s",
-                    session_id,
-                    candidate.candidate_id,
-                    analysis.prompt_tokens,
-                    analysis.completion_tokens,
-                )
-            elif analysis.provider_used == "local-fallback":
-                degraded_flags.append("llm_fallback_used")
-                logger.warning(
-                    "session_id=%s candidate_id=%s llm_local_fallback_used",
-                    session_id,
-                    candidate.candidate_id,
-                )
-            else:
-                logger.info(
-                    "session_id=%s candidate_id=%s llm_completed provider=%s prompt_tokens=%s completion_tokens=%s cost_estimate=%s",
-                    session_id,
-                    candidate.candidate_id,
-                    analysis.provider_used,
-                    analysis.prompt_tokens,
-                    analysis.completion_tokens,
-                    analysis.cost_estimate,
-                )
-
-            findings.append(
-                Finding(
-                    finding_id=f"finding:{candidate.candidate_id}",
-                    risk_type=candidate.risk_type,
-                    paragraph_id=candidate.paragraph_id,
-                    source_excerpt=None,
-                    title=analysis.title,
-                    summary=analysis.summary,
-                    confidence=analysis.confidence,
-                    suggested_edit=f"[{analysis.provider_used}] {analysis.suggested_edit}",
-                    evidence=evidence,
-                )
-            )
+            findings.append(finding)
 
         validation_flags = self._record_stage(
             session_id,
@@ -350,6 +281,359 @@ class PipelineOrchestrator:
 
     def get_status(self, session_id: str) -> PipelineStatusSnapshot | None:
         return self.state_store.get_status(session_id)
+
+    def get_timeline(self, session_id: str) -> list[dict] | None:
+        path = self.artifact_store.base_dir / session_id / "pipeline.jsonl"
+        if not path.exists():
+            return None
+
+        entries: list[dict] = []
+        with path.open("r", encoding="utf-8") as file:
+            for line in file:
+                line = line.strip()
+                if not line:
+                    continue
+                entries.append(json.loads(line))
+        return entries
+
+    def _process_candidate(
+        self,
+        session_id: str,
+        candidate,
+        jurisdiction: str,
+        observability: PipelineObservability,
+        degraded_flags: list[str],
+    ) -> Finding:
+        logger.info(
+            "session_id=%s candidate_id=%s candidate_processing_started risk_type=%s paragraph_id=%s",
+            session_id,
+            candidate.candidate_id,
+            candidate.risk_type,
+            candidate.paragraph_id,
+        )
+        self._log_candidate_event(
+            session_id,
+            candidate.candidate_id,
+            "candidate_selected",
+            "system",
+            f"Candidate selected for bounded decision loop ({candidate.risk_type})",
+            observability,
+        )
+
+        initial_query = self.query_builder.build(candidate, jurisdiction)
+        initial_result = self._run_retrieval_pass(
+            session_id=session_id,
+            candidate_id=candidate.candidate_id,
+            retrieval_request=initial_query,
+            pass_index=1,
+            observability=observability,
+        )
+
+        selected_query = initial_query
+        selected_result = initial_result
+        selected_evidence = initial_result.evidence
+        evidence_reason = self._evidence_reason(initial_result.evidence, initial_result.fallback_used)
+
+        self._log_candidate_event(
+            session_id,
+            candidate.candidate_id,
+            "evidence_evaluated",
+            "system",
+            f"Pass 1 evidence evaluation: {evidence_reason}",
+            observability,
+        )
+        logger.info(
+            "session_id=%s candidate_id=%s decision=evidence_evaluated pass=1 sufficient=%s reason=%s",
+            session_id,
+            candidate.candidate_id,
+            self._evidence_is_sufficient(initial_result.evidence, initial_result.fallback_used),
+            evidence_reason,
+        )
+
+        if not self._evidence_is_sufficient(initial_result.evidence, initial_result.fallback_used):
+            refined_query = self.query_builder.build_refined(
+                candidate=candidate,
+                jurisdiction=jurisdiction,
+                prior_query=initial_query.query,
+                evidence=initial_result.evidence,
+            )
+            self._log_candidate_event(
+                session_id,
+                candidate.candidate_id,
+                "retrieval_refine_decision",
+                "system",
+                "Evidence insufficient after pass 1; running one refined retrieval pass",
+                observability,
+            )
+            logger.info(
+                "session_id=%s candidate_id=%s decision=refine_retrieval reason=%s prior_query=%s refined_query=%s",
+                session_id,
+                candidate.candidate_id,
+                evidence_reason,
+                initial_query.query,
+                refined_query.query,
+            )
+            refined_result = self._run_retrieval_pass(
+                session_id=session_id,
+                candidate_id=candidate.candidate_id,
+                retrieval_request=refined_query,
+                pass_index=2,
+                observability=observability,
+            )
+            selected_query, selected_result = self._select_retrieval_result(
+                initial_query,
+                initial_result,
+                refined_query,
+                refined_result,
+            )
+            selected_evidence = selected_result.evidence
+            refined_reason = self._evidence_reason(selected_result.evidence, selected_result.fallback_used)
+            self._log_candidate_event(
+                session_id,
+                candidate.candidate_id,
+                "evidence_evaluated",
+                "system",
+                f"Final evidence decision after pass 2: {refined_reason}",
+                observability,
+            )
+            logger.info(
+                "session_id=%s candidate_id=%s decision=final_evidence_selection selected_pass=%s sufficient=%s reason=%s",
+                session_id,
+                candidate.candidate_id,
+                2 if selected_query.query == refined_query.query else 1,
+                self._evidence_is_sufficient(selected_result.evidence, selected_result.fallback_used),
+                refined_reason,
+            )
+
+        if selected_result.fallback_used:
+            degraded_flags.append("tavily_failed_fallback_used")
+            logger.warning(
+                "session_id=%s candidate_id=%s retrieval_fallback_used provider=%s",
+                session_id,
+                candidate.candidate_id,
+                selected_result.provider_used,
+            )
+
+        if not self._evidence_is_sufficient(selected_evidence, selected_result.fallback_used):
+            degraded_flags.append("retrieval_low_evidence")
+            logger.warning(
+                "session_id=%s candidate_id=%s retrieval_low_evidence provider=%s evidence_count=%s max_score=%s query=%s",
+                session_id,
+                candidate.candidate_id,
+                selected_result.provider_used,
+                len(selected_evidence),
+                self._max_retrieval_score(selected_evidence),
+                selected_query.query,
+            )
+
+        analysis = self.llm_analyzer.analyze(candidate, selected_evidence)
+        observability.llm_provider = analysis.provider_used
+        observability.llm_fallback_used = observability.llm_fallback_used or analysis.fallback_used
+        observability.llm_prompt_tokens += analysis.prompt_tokens
+        observability.llm_completion_tokens += analysis.completion_tokens
+        observability.llm_cost_estimate = round(
+            observability.llm_cost_estimate + analysis.cost_estimate,
+            6,
+        )
+        self._log_candidate_event(
+            session_id,
+            candidate.candidate_id,
+            "llm_analysis",
+            analysis.provider_used,
+            "Analyzed candidate after evidence resolution",
+            observability,
+        )
+        self._append_session_log(
+            session_id,
+            {
+                "timestamp": datetime.now(UTC).isoformat(),
+                "level": "INFO",
+                "event_type": "llm_analysis",
+                "provider": analysis.provider_used,
+                "candidate_id": candidate.candidate_id,
+                "message": "Analyzed candidate",
+                "prompt_tokens": analysis.prompt_tokens,
+                "completion_tokens": analysis.completion_tokens,
+                "cost_estimate": analysis.cost_estimate,
+            },
+        )
+        if analysis.provider_used == "vllm":
+            degraded_flags.append("openrouter_failed_vllm_used")
+            logger.warning(
+                "session_id=%s candidate_id=%s llm_fallback_to_vllm prompt_tokens=%s completion_tokens=%s",
+                session_id,
+                candidate.candidate_id,
+                analysis.prompt_tokens,
+                analysis.completion_tokens,
+            )
+        elif analysis.provider_used == "local-fallback":
+            degraded_flags.append("llm_fallback_used")
+            logger.warning(
+                "session_id=%s candidate_id=%s llm_local_fallback_used",
+                session_id,
+                candidate.candidate_id,
+            )
+        else:
+            logger.info(
+                "session_id=%s candidate_id=%s llm_completed provider=%s prompt_tokens=%s completion_tokens=%s cost_estimate=%s",
+                session_id,
+                candidate.candidate_id,
+                analysis.provider_used,
+                analysis.prompt_tokens,
+                analysis.completion_tokens,
+                analysis.cost_estimate,
+            )
+
+        self._log_candidate_event(
+            session_id,
+            candidate.candidate_id,
+            "finding_accepted",
+            "system",
+            f"Finding accepted with provider={analysis.provider_used} evidence_count={len(selected_evidence)}",
+            observability,
+        )
+        logger.info(
+            "session_id=%s candidate_id=%s decision=finding_accepted provider=%s evidence_count=%s confidence=%s",
+            session_id,
+            candidate.candidate_id,
+            analysis.provider_used,
+            len(selected_evidence),
+            analysis.confidence,
+        )
+
+        return Finding(
+            finding_id=f"finding:{candidate.candidate_id}",
+            risk_type=candidate.risk_type,
+            paragraph_id=candidate.paragraph_id,
+            source_excerpt=candidate.paragraph_text,
+            title=analysis.title,
+            summary=analysis.summary,
+            confidence=analysis.confidence,
+            suggested_edit=f"[{analysis.provider_used}] {analysis.suggested_edit}",
+            evidence=selected_evidence,
+        )
+
+    def _run_retrieval_pass(
+        self,
+        session_id: str,
+        candidate_id: str,
+        retrieval_request,
+        pass_index: int,
+        observability: PipelineObservability,
+    ):
+        logger.info(
+            "session_id=%s candidate_id=%s retrieval_pass_started pass=%s query=%s",
+            session_id,
+            candidate_id,
+            pass_index,
+            retrieval_request.query,
+        )
+        result = self.retriever.retrieve(retrieval_request)
+        self._log_candidate_event(
+            session_id,
+            candidate_id,
+            f"retrieval_pass_{pass_index}",
+            result.provider_used,
+            f"Retrieved {len(result.evidence)} evidence items on pass {pass_index}",
+            observability,
+        )
+        self._append_session_log(
+            session_id,
+            {
+                "timestamp": datetime.now(UTC).isoformat(),
+                "level": "INFO",
+                "event_type": f"retrieval_pass_{pass_index}",
+                "provider": result.provider_used,
+                "candidate_id": candidate_id,
+                "query": retrieval_request.query,
+                "message": f"Retrieved {len(result.evidence)} evidence items",
+                "evidence_count": len(result.evidence),
+                "fallback_used": result.fallback_used,
+            },
+        )
+        if result.fallback_used:
+            logger.warning(
+                "session_id=%s candidate_id=%s retrieval_fallback_used pass=%s provider=%s",
+                session_id,
+                candidate_id,
+                pass_index,
+                result.provider_used,
+            )
+        else:
+            logger.info(
+                "session_id=%s candidate_id=%s retrieval_completed pass=%s provider=%s evidence_count=%s",
+                session_id,
+                candidate_id,
+                pass_index,
+                result.provider_used,
+                len(result.evidence),
+            )
+        return result
+
+    def _select_retrieval_result(self, initial_query, initial_result, refined_query, refined_result):
+        initial_score = self._retrieval_quality_score(initial_result.evidence, initial_result.fallback_used)
+        refined_score = self._retrieval_quality_score(refined_result.evidence, refined_result.fallback_used)
+        if refined_score > initial_score:
+            return refined_query, refined_result
+        return initial_query, initial_result
+
+    def _retrieval_quality_score(self, evidence: list[EvidenceItem], fallback_used: bool) -> float:
+        base = len(evidence) * 10
+        if fallback_used:
+            base -= 10
+        return base + self._max_retrieval_score(evidence)
+
+    def _max_retrieval_score(self, evidence: list[EvidenceItem]) -> float:
+        if not evidence:
+            return 0.0
+        return max(item.retrieval_score for item in evidence)
+
+    def _evidence_is_sufficient(self, evidence: list[EvidenceItem], fallback_used: bool) -> bool:
+        if fallback_used:
+            return False
+        if len(evidence) < MIN_EVIDENCE_COUNT:
+            return False
+        return self._max_retrieval_score(evidence) >= MIN_RETRIEVAL_SCORE
+
+    def _evidence_reason(self, evidence: list[EvidenceItem], fallback_used: bool) -> str:
+        if fallback_used:
+            return "fallback_evidence_used"
+        if not evidence:
+            return "retrieval_empty"
+        if len(evidence) < MIN_EVIDENCE_COUNT:
+            return f"evidence_count_below_threshold:{len(evidence)}"
+        max_score = self._max_retrieval_score(evidence)
+        if max_score < MIN_RETRIEVAL_SCORE:
+            return f"retrieval_score_below_threshold:{max_score:.3f}"
+        return "evidence_sufficient"
+
+    def _log_candidate_event(
+        self,
+        session_id: str,
+        candidate_id: str,
+        event_type: str,
+        provider: str,
+        detail: str,
+        observability: PipelineObservability,
+    ) -> None:
+        event = PipelineEvent(
+            timestamp=datetime.now(UTC).isoformat(),
+            event_type=event_type,
+            provider=provider,
+            detail=f"{candidate_id}: {detail}",
+        )
+        observability.events.append(event)
+        self._append_session_log(
+            session_id,
+            {
+                "timestamp": event.timestamp,
+                "level": "INFO",
+                "event_type": event_type,
+                "provider": provider,
+                "candidate_id": candidate_id,
+                "message": detail,
+            },
+        )
 
     def _record_stage(self, session_id: str, stages: list[StageExecution], stage: str, fn, detail: str):
         started_at = datetime.now(UTC).isoformat()

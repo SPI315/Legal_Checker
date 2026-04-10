@@ -102,6 +102,30 @@ def test_process_document_logs_stage_progress(caplog) -> None:
     assert "pipeline_finished" in log_text
 
 
+def test_process_document_logs_decision_loop_steps(caplog) -> None:
+    client = TestClient(app)
+    file_bytes = _build_docx_bytes("Договор автоматически продлевается на следующий срок.")
+
+    with caplog.at_level(logging.INFO):
+        response = client.post(
+            "/api/documents/process?jurisdiction=RU&use_ner=false",
+            files={
+                "file": (
+                    "contract.docx",
+                    file_bytes,
+                    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                )
+            },
+        )
+
+    assert response.status_code == 200
+    log_text = caplog.text
+    assert "candidate_processing_started" in log_text
+    assert "retrieval_pass_started pass=1" in log_text
+    assert "decision=evidence_evaluated pass=1" in log_text
+    assert "decision=finding_accepted" in log_text
+
+
 def test_process_document_status_endpoint_and_session_logs_exist() -> None:
     client = TestClient(app)
     file_bytes = _build_docx_bytes("Договор автоматически продлевается на следующий срок.")
@@ -128,3 +152,48 @@ def test_process_document_status_endpoint_and_session_logs_exist() -> None:
     assert status_body["current_stage"] == "FINALIZE"
     assert Path(body["artifacts"]["events_path"]).exists()
     assert Path(body["artifacts"]["session_log_path"]).exists()
+
+
+def test_process_document_timeline_endpoint_works() -> None:
+    client = TestClient(app)
+    file_bytes = _build_docx_bytes("Договор автоматически продлевается на следующий срок.")
+
+    process_response = client.post(
+        "/api/documents/process?jurisdiction=RU&use_ner=false",
+        files={
+            "file": (
+                "contract.docx",
+                file_bytes,
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            )
+        },
+    )
+    session_id = process_response.json()["session_id"]
+
+    timeline_response = client.get(f"/api/documents/{session_id}/timeline")
+
+    assert timeline_response.status_code == 200
+    body = timeline_response.json()
+    assert len(body) >= 1
+    assert any(item["event_type"] == "pipeline_finished" for item in body)
+
+
+def test_process_document_start_endpoint_returns_session_and_status() -> None:
+    client = TestClient(app)
+    file_bytes = _build_docx_bytes("Договор автоматически продлевается на следующий срок.")
+
+    response = client.post(
+        "/api/documents/process/start?jurisdiction=RU&use_ner=false",
+        files={
+            "file": (
+                "contract.docx",
+                file_bytes,
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            )
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["session_id"]
+    assert body["status"] in {"queued", "success", "degraded_success"}

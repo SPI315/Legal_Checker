@@ -82,3 +82,27 @@ class DocumentStatusResponse(BaseModel):
     file_type: str
     degraded_flags: list[str]
     last_event: PipelineEventResponse | None = None
+
+
+class TimelineEntryResponse(BaseModel):
+    timestamp: str
+    level: str
+    event_type: str
+    provider: str | None = None
+    stage: str | None = None
+    candidate_id: str | None = None
+    message: str
+    query: str | None = None
+    evidence_count: int | None = None
+    fallback_used: bool | None = None
+    status: str | None = None
+    findings: int | None = None
+    degraded_flags: list[str] | None = None
+
+
+class StartProcessResponse(BaseModel):
+    session_id: str
+    status: str
+    current_stage: str | None = None
+    file_name: str
+    file_type: str

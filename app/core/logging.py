@@ -12,3 +12,10 @@ def configure_logging() -> None:
         level=logging.INFO,
         format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
     )
+    for noisy_logger in (
+        "httpx",
+        "httpcore",
+        "huggingface_hub",
+        "transformers",
+    ):
+        logging.getLogger(noisy_logger).setLevel(logging.WARNING)

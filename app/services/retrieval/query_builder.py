@@ -6,7 +6,7 @@ import logging
 import httpx
 
 from app.services.http_utils import retry_with_backoff
-from app.services.orchestration.types import RiskCandidate
+from app.services.orchestration.types import EvidenceItem, RiskCandidate
 from app.services.retrieval.types import RetrievalRequest
 
 logger = logging.getLogger(__name__)
@@ -44,6 +44,19 @@ class RetrievalQueryBuilder:
 
     def build(self, candidate: RiskCandidate, jurisdiction: str) -> RetrievalRequest:
         query = self._build_query(candidate, jurisdiction)
+        return self._request(candidate, jurisdiction, query)
+
+    def build_refined(
+        self,
+        candidate: RiskCandidate,
+        jurisdiction: str,
+        prior_query: str,
+        evidence: list[EvidenceItem],
+    ) -> RetrievalRequest:
+        query = self._build_refined_query(candidate, jurisdiction, prior_query, evidence)
+        return self._request(candidate, jurisdiction, query)
+
+    def _request(self, candidate: RiskCandidate, jurisdiction: str, query: str) -> RetrievalRequest:
         return RetrievalRequest(
             query=query,
             risk_type=candidate.risk_type,
@@ -53,10 +66,20 @@ class RetrievalQueryBuilder:
         )
 
     def _build_query(self, candidate: RiskCandidate, jurisdiction: str) -> str:
-        llm_query = self._build_query_with_llm(candidate, jurisdiction)
+        llm_query = self._build_query_with_llm(
+            candidate=candidate,
+            jurisdiction=jurisdiction,
+            prompt_payload={
+                "mode": "initial",
+                "jurisdiction": jurisdiction,
+                "risk_type": candidate.risk_type,
+                "matched_text": candidate.matched_text,
+                "paragraph_excerpt": candidate.paragraph_text[:700],
+            },
+        )
         if llm_query:
             logger.info(
-                "retrieval_query_generated provider=llm risk_type=%s query=%s",
+                "retrieval_query_generated provider=llm mode=initial risk_type=%s query=%s",
                 candidate.risk_type,
                 llm_query,
             )
@@ -64,20 +87,53 @@ class RetrievalQueryBuilder:
 
         fallback_query = self._fallback_query(candidate, jurisdiction)
         logger.info(
-            "retrieval_query_generated provider=fallback risk_type=%s query=%s",
+            "retrieval_query_generated provider=fallback mode=initial risk_type=%s query=%s",
             candidate.risk_type,
             fallback_query,
         )
         return fallback_query
 
-    def _build_query_with_llm(self, candidate: RiskCandidate, jurisdiction: str) -> str | None:
-        prompt_payload = {
-            "jurisdiction": jurisdiction,
-            "risk_type": candidate.risk_type,
-            "matched_text": candidate.matched_text,
-            "paragraph_excerpt": candidate.paragraph_text[:700],
-        }
+    def _build_refined_query(
+        self,
+        candidate: RiskCandidate,
+        jurisdiction: str,
+        prior_query: str,
+        evidence: list[EvidenceItem],
+    ) -> str:
+        evidence_titles = [item.title for item in evidence[:3]]
+        evidence_snippets = [item.snippet[:180] for item in evidence[:2] if item.snippet]
 
+        llm_query = self._build_query_with_llm(
+            candidate=candidate,
+            jurisdiction=jurisdiction,
+            prompt_payload={
+                "mode": "refined",
+                "jurisdiction": jurisdiction,
+                "risk_type": candidate.risk_type,
+                "matched_text": candidate.matched_text,
+                "paragraph_excerpt": candidate.paragraph_text[:700],
+                "prior_query": prior_query,
+                "evidence_titles": evidence_titles,
+                "evidence_snippets": evidence_snippets,
+            },
+        )
+        if llm_query:
+            logger.info(
+                "retrieval_query_generated provider=llm mode=refined risk_type=%s query=%s",
+                candidate.risk_type,
+                llm_query,
+            )
+            return llm_query
+
+        fallback_query = self._fallback_refined_query(candidate, jurisdiction, evidence_titles)
+        logger.info(
+            "retrieval_query_generated provider=fallback mode=refined risk_type=%s query=%s",
+            candidate.risk_type,
+            fallback_query,
+        )
+        return fallback_query
+
+    def _build_query_with_llm(self, candidate: RiskCandidate, jurisdiction: str, prompt_payload: dict) -> str | None:
         if self.openrouter_api_key:
             result = self._call_chat_api(
                 url=f"{self.openrouter_base_url}/chat/completions",
@@ -105,6 +161,7 @@ class RetrievalQueryBuilder:
             if result:
                 return result
 
+        _ = candidate, jurisdiction
         return None
 
     def _call_chat_api(self, url: str, headers: dict[str, str], body: dict) -> str | None:
@@ -162,6 +219,7 @@ class RetrievalQueryBuilder:
                     "Запрос должен быть естественным, юридическим и пригодным для поиска норм, судебной практики "
                     "или разъяснений по рисковой формулировке договора. "
                     "Не используй внутренние технические коды риска. "
+                    "Если mode=refined, уточни запрос с учетом предыдущей попытки поиска и уже найденных следов. "
                     "Не добавляй пояснения, markdown, нумерацию или кавычки. "
                     "Верни только одну строку поискового запроса."
                 ),
@@ -184,3 +242,8 @@ class RetrievalQueryBuilder:
         hint = RISK_SEARCH_HINTS.get(candidate.risk_type, candidate.matched_text)
         excerpt = " ".join(candidate.paragraph_text.split())[:120]
         return f"{hint} {excerpt} {jurisdiction} ГК РФ"
+
+    def _fallback_refined_query(self, candidate: RiskCandidate, jurisdiction: str, evidence_titles: list[str]) -> str:
+        hint = RISK_SEARCH_HINTS.get(candidate.risk_type, candidate.matched_text)
+        evidence_hint = evidence_titles[0] if evidence_titles else "судебная практика"
+        return f"{hint} {candidate.matched_text} {evidence_hint} {jurisdiction} ГК РФ"

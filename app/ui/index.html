@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Legal Checker</title>
+  <link rel="stylesheet" href="/ui/styles.css" />
+</head>
+<body>
+  <div class="shell">
+    <header class="hero">
+      <div>
+        <p class="eyebrow">Legal Checker</p>
+        <h1>Проверка договора в один проход</h1>
+        <p class="lead">Загрузи `pdf` или `docx`, посмотри историю шагов справа и сразу скачай итоговый `docx`-отчет.</p>
+      </div>
+      <div class="hero-card">
+        <div class="metric-label">Режим</div>
+        <div class="metric-value" id="healthStatus">Проверка API...</div>
+      </div>
+    </header>
+
+    <main class="layout">
+      <section class="panel upload-panel">
+        <form id="uploadForm">
+          <label class="dropzone" id="dropzone" for="fileInput">
+            <input id="fileInput" type="file" name="file" accept=".pdf,.docx" hidden />
+            <div class="dropzone-copy">
+              <div class="drop-title">Перетащи документ сюда</div>
+              <div class="drop-subtitle">или нажми, чтобы выбрать файл</div>
+              <div class="file-pill" id="selectedFile">Файл не выбран</div>
+            </div>
+          </label>
+
+          <div class="controls">
+            <label class="field">
+              <span>Юрисдикция</span>
+              <input id="jurisdictionInput" type="text" value="RU" maxlength="8" />
+            </label>
+            <label class="toggle">
+              <input id="useNerInput" type="checkbox" checked />
+              <span>Использовать NER</span>
+            </label>
+          </div>
+
+          <div class="actions">
+            <button id="submitButton" type="submit">Запустить проверку</button>
+            <a id="downloadLink" class="download-link disabled" href="#" aria-disabled="true">Скачать DOCX-отчет</a>
+          </div>
+        </form>
+
+        <div class="status-strip">
+          <div>
+            <div class="metric-label">Статус</div>
+            <div class="metric-value" id="resultStatus">Ожидание</div>
+          </div>
+          <div>
+            <div class="metric-label">Session ID</div>
+            <div class="metric-inline" id="sessionId">-</div>
+          </div>
+        </div>
+
+        <div class="panel-subsection">
+          <div class="section-title">Найденные риски</div>
+          <div id="findingsList" class="empty-state">После запуска здесь появятся findings и evidence.</div>
+        </div>
+      </section>
+
+      <aside class="panel timeline-panel">
+        <div class="section-title">История выполнения</div>
+        <div id="timelineList" class="timeline empty-state">Пока пусто. После прогона здесь появится человекочитаемая история шагов.</div>
+      </aside>
+    </main>
+  </div>
+
+  <script src="/ui/app.js"></script>
+</body>
+</html>
