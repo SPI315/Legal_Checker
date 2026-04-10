@@ -4,6 +4,8 @@ import logging
 from fastapi.testclient import TestClient
 
 from app.main import app
+from app.services.orchestration.orchestrator import PipelineOrchestrator
+from app.services.orchestration.types import EvidenceItem
 
 
 def _build_docx_bytes(text: str) -> bytes:
@@ -197,3 +199,76 @@ def test_process_document_start_endpoint_returns_session_and_status() -> None:
     body = response.json()
     assert body["session_id"]
     assert body["status"] in {"queued", "success", "degraded_success"}
+
+
+def test_legal_basis_support_requires_citation_in_evidence() -> None:
+    orchestrator = PipelineOrchestrator.__new__(PipelineOrchestrator)
+    evidence = [
+        EvidenceItem(
+            source_id="s1",
+            source_type="web",
+            title="ГК РФ Статья 469. Качество товара",
+            snippet="Продавец обязан передать покупателю товар, качество которого соответствует договору купли-продажи.",
+            uri="https://www.consultant.ru/document/cons_doc_LAW_9027/",
+            retrieval_score=0.9,
+            retrieved_at="now",
+        )
+    ]
+
+    assert orchestrator._legal_basis_is_supported("ст. 469 ГК РФ", evidence) is True
+    assert orchestrator._legal_basis_is_supported("ст. 475 ГК РФ", evidence) is False
+
+
+def test_unsupported_citation_is_detected_outside_legal_basis() -> None:
+    class Draft:
+        title = "Ограничение ответственности"
+        summary = "Условие может противоречить ст. 475 ГК РФ."
+        legal_basis = ""
+        suggested_edit = "Уточнить ответственность сторон."
+
+    orchestrator = PipelineOrchestrator.__new__(PipelineOrchestrator)
+    evidence = [
+        EvidenceItem(
+            source_id="s1",
+            source_type="web",
+            title="ГК РФ Статья 469. Качество товара",
+            snippet="Товар должен соответствовать договору купли-продажи.",
+            uri="https://www.consultant.ru/document/cons_doc_LAW_9027/",
+            retrieval_score=0.9,
+            retrieved_at="now",
+        )
+    ]
+
+    assert orchestrator._unsupported_finding_citation_terms(Draft(), evidence) == ["ст. 475"]
+
+
+def test_summary_is_prefixed_with_contract_clause() -> None:
+    orchestrator = PipelineOrchestrator.__new__(PipelineOrchestrator)
+
+    assert orchestrator._summary_with_clause("p2_4", "Продавец ограничивает ответственность.") == (
+        "Пункт 4: Продавец ограничивает ответственность."
+    )
+    assert orchestrator._summary_with_clause("p2_4", "Пункт 4: Продавец ограничивает ответственность.") == (
+        "Пункт 4: Продавец ограничивает ответственность."
+    )
+
+
+def test_legal_basis_includes_best_source_link_and_excerpt() -> None:
+    orchestrator = PipelineOrchestrator.__new__(PipelineOrchestrator)
+    evidence = [
+        EvidenceItem(
+            source_id="s1",
+            source_type="web",
+            title="ГК РФ Статья 475. Последствия передачи товара",
+            snippet="Если недостатки товара не были оговорены продавцом, покупатель вправе потребовать устранения недостатков.",
+            uri="https://www.consultant.ru/document/cons_doc_LAW_9027/17c3854134fe9a/",
+            retrieval_score=0.9,
+            retrieved_at="now",
+        )
+    ]
+
+    legal_basis = orchestrator._legal_basis_with_best_source("ст. 475 ГК РФ", evidence)
+
+    assert "ст. 475 ГК РФ" in legal_basis
+    assert "Фрагмент источника:" in legal_basis
+    assert "https://www.consultant.ru/document/cons_doc_LAW_9027/17c3854134fe9a/" in legal_basis

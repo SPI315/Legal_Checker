@@ -268,11 +268,29 @@ button:disabled {
 }
 
 .finding-summary,
-.finding-suggested {
+.finding-suggested,
+.legal-basis,
+.finding-warning {
   margin: 10px 0 0;
   line-height: 1.5;
   overflow-wrap: anywhere;
   word-break: break-word;
+}
+
+.legal-basis {
+  padding: 12px 14px;
+  border-radius: 14px;
+  background: #f7ede1;
+  border: 1px solid rgba(217, 203, 184, 0.9);
+}
+
+.finding-warning {
+  padding: 12px 14px;
+  border-radius: 14px;
+  color: #7c361f;
+  background: #fff0df;
+  border: 1px solid rgba(165, 76, 47, 0.35);
+  font-weight: 700;
 }
 
 .evidence-list {
@@ -282,6 +300,12 @@ button:disabled {
 }
 
 .evidence-item a {
+  color: var(--accent-dark);
+  overflow-wrap: anywhere;
+  word-break: break-all;
+}
+
+.legal-basis a {
   color: var(--accent-dark);
   overflow-wrap: anywhere;
   word-break: break-all;

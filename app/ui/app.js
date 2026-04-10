@@ -145,6 +145,12 @@ function renderFindings(findings) {
 
   findingsList.innerHTML = findings
     .map((finding) => {
+      const warning = finding.legal_basis_supported === false
+        ? `<div class="finding-warning">В тексте finding есть правовая ссылка, не подтверждённая evidence. Проверь источники вручную.</div>`
+        : "";
+      const legalBasis = finding.legal_basis
+        ? `<div class="legal-basis"><strong>Правовое основание:</strong><br>${linkify(escapeHtml(finding.legal_basis))}</div>`
+        : "";
       const evidence = finding.evidence.length
         ? `<div class="evidence-list">${finding.evidence
             .map(
@@ -162,7 +168,9 @@ function renderFindings(findings) {
         <article class="finding-card">
           <h3 class="finding-title">${escapeHtml(finding.title)}</h3>
           <div class="finding-meta">Риск: ${escapeHtml(finding.risk_type)} | Абзац: ${escapeHtml(finding.paragraph_id)} | Confidence: ${finding.confidence}</div>
+          ${warning}
           <p class="finding-summary">${escapeHtml(finding.summary)}</p>
+          ${legalBasis}
           <p class="finding-suggested"><strong>Правка:</strong> ${escapeHtml(finding.suggested_edit)}</p>
           ${evidence}
         </article>`;
@@ -194,6 +202,7 @@ async function loadTimeline(activeSessionId) {
         </article>`
     )
     .join("");
+  timelineList.scrollTop = timelineList.scrollHeight;
 }
 
 function humanizeEvent(item) {
@@ -202,8 +211,12 @@ function humanizeEvent(item) {
     candidate_selected: "Выбран кандидат риска",
     retrieval_pass_1: "Retrieval pass 1",
     retrieval_pass_2: "Retrieval pass 2",
+    retrieval_pass_3: "Retrieval pass 3",
     evidence_evaluated: "Оценка достаточности evidence",
     retrieval_refine_decision: "Решение о втором retrieval-pass",
+    legal_basis_evaluated: "Проверка правового основания",
+    legal_basis_refine_decision: "Уточнение поиска по правовому основанию",
+    legal_basis_warning: "Предупреждение по правовому основанию",
     llm_analysis: "LLM-анализ",
     finding_accepted: "Finding принят",
     pipeline_finished: "Pipeline завершен",
@@ -252,6 +265,13 @@ function escapeHtml(value) {
     .replaceAll(">", "&gt;")
     .replaceAll('"', "&quot;")
     .replaceAll("'", "&#39;");
+}
+
+function linkify(value) {
+  return String(value).replace(
+    /(https?:\/\/[^\s<]+)/g,
+    '<a href="$1" target="_blank" rel="noreferrer">$1</a>'
+  ).replaceAll("\n", "<br>");
 }
 
 async function loadHealth() {

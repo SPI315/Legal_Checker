@@ -212,6 +212,8 @@ def _build_process_response(result) -> ProcessDocumentResponse:
                 paragraph_id=finding.paragraph_id,
                 title=finding.title,
                 summary=finding.summary,
+                legal_basis=finding.legal_basis,
+                legal_basis_supported=finding.legal_basis_supported,
                 confidence=finding.confidence,
                 suggested_edit=finding.suggested_edit,
                 evidence=[EvidenceResponse(**asdict(item)) for item in finding.evidence],

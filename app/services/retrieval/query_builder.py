@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 
 import httpx
 
@@ -11,25 +12,37 @@ from app.services.retrieval.types import RetrievalRequest
 
 logger = logging.getLogger(__name__)
 
-RISK_SEARCH_HINTS = {
-    "AUTO_RENEWAL": "автоматическая пролонгация договора без согласования сторон",
-    "UNILATERAL_LIABILITY_LIMITATION": "ограничение ответственности продавца за скрытые недостатки товара",
-    "UNILATERAL_CHANGE": "одностороннее изменение условий договора",
+MAX_QUERY_LENGTH = 180
+CYRILLIC_RATIO_THRESHOLD = 0.45
+NOISY_LATIN_TOKENS = {
+    "unjustified",
+    "legal",
+    "text",
+    "clause",
+    "unsupported",
+    "citation",
+    "article",
+    "basis",
+}
+RISK_QUERY_HINTS = {
+    "AUTO_RENEWAL": "автопролонгация договора судебная практика ГК РФ",
+    "UNILATERAL_LIABILITY_LIMITATION": "ограничение ответственности продавца скрытые недостатки товара судебная практика ГК РФ",
+    "UNILATERAL_CHANGE": "одностороннее изменение условий договора судебная практика ГК РФ",
 }
 
 
 class RetrievalQueryBuilder:
     def __init__(
         self,
-        model: str = "openai/gpt-4o-mini",
-        timeout_sec: int = 10,
-        openrouter_api_key: str = "",
-        openrouter_base_url: str = "https://openrouter.ai/api/v1",
-        openrouter_http_referer: str = "",
-        openrouter_title: str = "Legal Checker API",
-        vllm_base_url: str = "",
-        vllm_api_key: str = "",
-        vllm_model: str = "",
+        model: str,
+        timeout_sec: int,
+        openrouter_api_key: str,
+        openrouter_base_url: str,
+        openrouter_http_referer: str,
+        openrouter_title: str,
+        vllm_base_url: str,
+        vllm_api_key: str,
+        vllm_model: str,
     ) -> None:
         self.model = model
         self.timeout_sec = timeout_sec
@@ -43,20 +56,22 @@ class RetrievalQueryBuilder:
         self.max_retries = 2
 
     def build(self, candidate: RiskCandidate, jurisdiction: str) -> RetrievalRequest:
-        query = self._build_query(candidate, jurisdiction)
-        return self._request(candidate, jurisdiction, query)
-
-    def build_refined(
-        self,
-        candidate: RiskCandidate,
-        jurisdiction: str,
-        prior_query: str,
-        evidence: list[EvidenceItem],
-    ) -> RetrievalRequest:
-        query = self._build_refined_query(candidate, jurisdiction, prior_query, evidence)
-        return self._request(candidate, jurisdiction, query)
-
-    def _request(self, candidate: RiskCandidate, jurisdiction: str, query: str) -> RetrievalRequest:
+        fallback_query = self._fallback_query(candidate, jurisdiction)
+        query = self._generate_query(
+            candidate=candidate,
+            jurisdiction=jurisdiction,
+            mode="initial",
+            fallback_query=fallback_query,
+            prior_query=None,
+            evidence=None,
+            focus_terms=None,
+        )
+        logger.info(
+            "retrieval_query_generated provider=%s mode=initial risk_type=%s query=%s",
+            "llm" if query != fallback_query else "fallback",
+            candidate.risk_type,
+            query,
+        )
         return RetrievalRequest(
             query=query,
             risk_type=candidate.risk_type,
@@ -65,104 +80,101 @@ class RetrievalQueryBuilder:
             paragraph_text=candidate.paragraph_text,
         )
 
-    def _build_query(self, candidate: RiskCandidate, jurisdiction: str) -> str:
-        llm_query = self._build_query_with_llm(
-            candidate=candidate,
-            jurisdiction=jurisdiction,
-            prompt_payload={
-                "mode": "initial",
-                "jurisdiction": jurisdiction,
-                "risk_type": candidate.risk_type,
-                "matched_text": candidate.matched_text,
-                "paragraph_excerpt": candidate.paragraph_text[:700],
-            },
-        )
-        if llm_query:
-            logger.info(
-                "retrieval_query_generated provider=llm mode=initial risk_type=%s query=%s",
-                candidate.risk_type,
-                llm_query,
-            )
-            return llm_query
-
-        fallback_query = self._fallback_query(candidate, jurisdiction)
-        logger.info(
-            "retrieval_query_generated provider=fallback mode=initial risk_type=%s query=%s",
-            candidate.risk_type,
-            fallback_query,
-        )
-        return fallback_query
-
-    def _build_refined_query(
+    def build_refined(
         self,
         candidate: RiskCandidate,
         jurisdiction: str,
         prior_query: str,
         evidence: list[EvidenceItem],
-    ) -> str:
-        evidence_titles = [item.title for item in evidence[:3]]
-        evidence_snippets = [item.snippet[:180] for item in evidence[:2] if item.snippet]
-
-        llm_query = self._build_query_with_llm(
+        focus_terms: list[str] | None = None,
+    ) -> RetrievalRequest:
+        fallback_query = self._refined_fallback_query(candidate, jurisdiction, prior_query, focus_terms)
+        query = self._generate_query(
             candidate=candidate,
             jurisdiction=jurisdiction,
-            prompt_payload={
-                "mode": "refined",
-                "jurisdiction": jurisdiction,
-                "risk_type": candidate.risk_type,
-                "matched_text": candidate.matched_text,
-                "paragraph_excerpt": candidate.paragraph_text[:700],
-                "prior_query": prior_query,
-                "evidence_titles": evidence_titles,
-                "evidence_snippets": evidence_snippets,
-            },
+            mode="refined",
+            fallback_query=fallback_query,
+            prior_query=prior_query,
+            evidence=evidence,
+            focus_terms=focus_terms,
         )
-        if llm_query:
-            logger.info(
-                "retrieval_query_generated provider=llm mode=refined risk_type=%s query=%s",
-                candidate.risk_type,
-                llm_query,
-            )
-            return llm_query
-
-        fallback_query = self._fallback_refined_query(candidate, jurisdiction, evidence_titles)
         logger.info(
-            "retrieval_query_generated provider=fallback mode=refined risk_type=%s query=%s",
+            "retrieval_query_generated provider=%s mode=refined risk_type=%s query=%s",
+            "llm" if query != fallback_query else "fallback",
             candidate.risk_type,
-            fallback_query,
+            query,
         )
-        return fallback_query
+        return RetrievalRequest(
+            query=query,
+            risk_type=candidate.risk_type,
+            jurisdiction=jurisdiction,
+            paragraph_id=candidate.paragraph_id,
+            paragraph_text=candidate.paragraph_text,
+        )
 
-    def _build_query_with_llm(self, candidate: RiskCandidate, jurisdiction: str, prompt_payload: dict) -> str | None:
-        if self.openrouter_api_key:
-            result = self._call_chat_api(
-                url=f"{self.openrouter_base_url}/chat/completions",
-                headers=self._openrouter_headers(),
-                body={
-                    "model": self.model,
-                    "messages": self._messages(prompt_payload),
-                },
-            )
-            if result:
-                return result
+    def _generate_query(
+        self,
+        candidate: RiskCandidate,
+        jurisdiction: str,
+        mode: str,
+        fallback_query: str,
+        prior_query: str | None,
+        evidence: list[EvidenceItem] | None,
+        focus_terms: list[str] | None,
+    ) -> str:
+        generated = self._call_openrouter(candidate, jurisdiction, mode, prior_query, evidence, focus_terms)
+        if generated is None:
+            generated = self._call_vllm(candidate, jurisdiction, mode, prior_query, evidence, focus_terms)
+        return self._sanitize_query(generated or fallback_query, fallback_query)
 
-        if self.vllm_base_url:
-            result = self._call_chat_api(
-                url=f"{self.vllm_base_url}/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {self.vllm_api_key or 'local-token'}",
-                    "Content-Type": "application/json",
-                },
-                body={
-                    "model": self.vllm_model or self.model,
-                    "messages": self._messages(prompt_payload),
-                },
-            )
-            if result:
-                return result
+    def _call_openrouter(
+        self,
+        candidate: RiskCandidate,
+        jurisdiction: str,
+        mode: str,
+        prior_query: str | None,
+        evidence: list[EvidenceItem] | None,
+        focus_terms: list[str] | None,
+    ) -> str | None:
+        if not self.openrouter_api_key:
+            return None
 
-        _ = candidate, jurisdiction
-        return None
+        headers = {
+            "Authorization": f"Bearer {self.openrouter_api_key}",
+            "Content-Type": "application/json",
+        }
+        if self.openrouter_http_referer:
+            headers["HTTP-Referer"] = self.openrouter_http_referer
+        if self.openrouter_title:
+            headers["X-OpenRouter-Title"] = self.openrouter_title
+
+        body = {
+            "model": self.model,
+            "messages": self._messages(candidate, jurisdiction, mode, prior_query, evidence, focus_terms),
+        }
+        return self._call_chat_api(f"{self.openrouter_base_url}/chat/completions", headers, body)
+
+    def _call_vllm(
+        self,
+        candidate: RiskCandidate,
+        jurisdiction: str,
+        mode: str,
+        prior_query: str | None,
+        evidence: list[EvidenceItem] | None,
+        focus_terms: list[str] | None,
+    ) -> str | None:
+        if not self.vllm_base_url:
+            return None
+
+        headers = {
+            "Authorization": f"Bearer {self.vllm_api_key or 'local-token'}",
+            "Content-Type": "application/json",
+        }
+        body = {
+            "model": self.vllm_model or self.model,
+            "messages": self._messages(candidate, jurisdiction, mode, prior_query, evidence, focus_terms),
+        }
+        return self._call_chat_api(f"{self.vllm_base_url}/chat/completions", headers, body)
 
     def _call_chat_api(self, url: str, headers: dict[str, str], body: dict) -> str | None:
         try:
@@ -173,14 +185,14 @@ class RetrievalQueryBuilder:
         except Exception:
             return None
 
-        content = self._extract_content(payload)
-        if not content:
+        choices = payload.get("choices") or []
+        if not choices:
             return None
-
-        query = self._normalize_query(content)
-        if len(query) < 12:
-            return None
-        return query
+        message = choices[0].get("message") or {}
+        content = message.get("content") or ""
+        if isinstance(content, list):
+            content = "".join(part.get("text", "") for part in content if isinstance(part, dict))
+        return str(content).strip()
 
     def _perform_request(self, url: str, headers: dict[str, str], body: dict) -> dict:
         with httpx.Client(timeout=self.timeout_sec) as client:
@@ -188,62 +200,101 @@ class RetrievalQueryBuilder:
             response.raise_for_status()
             return response.json()
 
-    def _extract_content(self, payload: dict) -> str:
-        choices = payload.get("choices") or []
-        if not choices:
-            return ""
-        message = choices[0].get("message") or {}
-        content = message.get("content") or ""
-        if isinstance(content, list):
-            return "".join(part.get("text", "") for part in content if isinstance(part, dict))
-        return str(content)
-
-    def _normalize_query(self, content: str) -> str:
-        cleaned = content.strip()
-        if cleaned.startswith("{"):
-            try:
-                parsed = json.loads(cleaned)
-                cleaned = str(parsed.get("query") or "").strip()
-            except json.JSONDecodeError:
-                pass
-        cleaned = cleaned.replace("\n", " ").replace("\r", " ")
-        cleaned = " ".join(cleaned.split())
-        return cleaned[:220]
-
-    def _messages(self, payload: dict) -> list[dict]:
+    def _messages(
+        self,
+        candidate: RiskCandidate,
+        jurisdiction: str,
+        mode: str,
+        prior_query: str | None,
+        evidence: list[EvidenceItem] | None,
+        focus_terms: list[str] | None,
+    ) -> list[dict]:
+        payload = {
+            "mode": mode,
+            "jurisdiction": jurisdiction,
+            "risk_type": candidate.risk_type,
+            "paragraph_text": candidate.paragraph_text[:700],
+            "matched_text": candidate.matched_text,
+            "prior_query": prior_query,
+            "evidence_titles": [item.title for item in (evidence or [])[:3]],
+            "focus_terms": focus_terms or [],
+        }
         return [
             {
                 "role": "system",
                 "content": (
-                    "Сформируй один короткий поисковый запрос на русском языке для web-поиска по правовым источникам. "
-                    "Запрос должен быть естественным, юридическим и пригодным для поиска норм, судебной практики "
-                    "или разъяснений по рисковой формулировке договора. "
-                    "Не используй внутренние технические коды риска. "
-                    "Если mode=refined, уточни запрос с учетом предыдущей попытки поиска и уже найденных следов. "
-                    "Не добавляй пояснения, markdown, нумерацию или кавычки. "
-                    "Верни только одну строку поискового запроса."
+                    "Ты составляешь короткий юридический поисковый запрос для web-retrieval по договорному риску. "
+                    "Верни только одну строку запроса на русском языке без пояснений, без JSON и без кавычек. "
+                    "Запрос должен быть естественным, пригодным для поиска по судебной практике и правовым материалам. "
+                    "Не вставляй внутренние коды риска, технические метки, английские слова, служебные хвосты и мусорные токены. "
+                    "Если mode=refined, уточни запрос так, чтобы найти правовое обоснование и подтверждающие источники. "
+                    "Если есть focus_terms, обязательно включи их в запрос в естественной форме. "
+                    "Длина ответа не должна превышать 18 слов."
                 ),
             },
             {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
         ]
 
-    def _openrouter_headers(self) -> dict[str, str]:
-        headers = {
-            "Authorization": f"Bearer {self.openrouter_api_key}",
-            "Content-Type": "application/json",
-        }
-        if self.openrouter_http_referer:
-            headers["HTTP-Referer"] = self.openrouter_http_referer
-        if self.openrouter_title:
-            headers["X-OpenRouter-Title"] = self.openrouter_title
-        return headers
+    def _sanitize_query(self, query: str, fallback_query: str) -> str:
+        cleaned = " ".join((query or "").split())
+        if not cleaned:
+            return fallback_query
+
+        words = []
+        for word in cleaned.split():
+            normalized = re.sub(r"[^\wА-Яа-яЁё\-./]", "", word)
+            if not normalized:
+                continue
+            if normalized.lower() in NOISY_LATIN_TOKENS:
+                continue
+            words.append(normalized)
+
+        cleaned = " ".join(words).strip()[:MAX_QUERY_LENGTH].strip(" ,.;:-")
+        if not cleaned:
+            return fallback_query
+        if self._looks_too_noisy(cleaned):
+            return fallback_query
+        return cleaned
+
+    def _looks_too_noisy(self, query: str) -> bool:
+        letters = re.findall(r"[A-Za-zА-Яа-яЁё]", query)
+        if not letters:
+            return True
+        cyrillic = re.findall(r"[А-Яа-яЁё]", query)
+        if len(cyrillic) / len(letters) < CYRILLIC_RATIO_THRESHOLD:
+            return True
+
+        latin_words = re.findall(r"\b[A-Za-z][A-Za-z\-]+\b", query)
+        if any(word.lower() in NOISY_LATIN_TOKENS for word in latin_words):
+            return True
+
+        return False
 
     def _fallback_query(self, candidate: RiskCandidate, jurisdiction: str) -> str:
-        hint = RISK_SEARCH_HINTS.get(candidate.risk_type, candidate.matched_text)
-        excerpt = " ".join(candidate.paragraph_text.split())[:120]
-        return f"{hint} {excerpt} {jurisdiction} ГК РФ"
+        hint = RISK_QUERY_HINTS.get(candidate.risk_type, "судебная практика по рисковому условию договора")
+        matched = self._trim_terms(candidate.matched_text)
+        query = f"{hint} {matched} {jurisdiction}".strip()
+        return self._truncate_query(query)
 
-    def _fallback_refined_query(self, candidate: RiskCandidate, jurisdiction: str, evidence_titles: list[str]) -> str:
-        hint = RISK_SEARCH_HINTS.get(candidate.risk_type, candidate.matched_text)
-        evidence_hint = evidence_titles[0] if evidence_titles else "судебная практика"
-        return f"{hint} {candidate.matched_text} {evidence_hint} {jurisdiction} ГК РФ"
+    def _refined_fallback_query(
+        self,
+        candidate: RiskCandidate,
+        jurisdiction: str,
+        prior_query: str,
+        focus_terms: list[str] | None,
+    ) -> str:
+        extra = " ".join(self._trim_terms(term) for term in (focus_terms or []) if term).strip()
+        base_hint = RISK_QUERY_HINTS.get(candidate.risk_type, "судебная практика по рисковому условию договора")
+        if extra:
+            query = f"{base_hint} {extra} {jurisdiction}"
+        else:
+            query = f"{base_hint} {self._trim_terms(candidate.matched_text)} судебная практика {jurisdiction}"
+        if prior_query and extra and extra not in prior_query:
+            query = f"{query} {extra}"
+        return self._truncate_query(query)
+
+    def _trim_terms(self, text: str) -> str:
+        return " ".join((text or "").split())[:80].strip()
+
+    def _truncate_query(self, query: str) -> str:
+        return " ".join(query.split())[:MAX_QUERY_LENGTH].strip(" ,.;:-")

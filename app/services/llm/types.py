@@ -5,6 +5,7 @@ from dataclasses import dataclass
 class AnalysisDraft:
     title: str
     summary: str
+    legal_basis: str
     confidence: float
     suggested_edit: str
     provider_used: str

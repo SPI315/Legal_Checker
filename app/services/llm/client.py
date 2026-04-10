@@ -141,8 +141,11 @@ class RiskLlmAnalyzer:
         return AnalysisDraft(
             title=str(parsed.get("title") or "Юридический риск"),
             summary=str(parsed.get("summary") or "Обнаружена потенциально рискованная формулировка."),
+            legal_basis=str(parsed.get("legal_basis") or "").strip(),
             confidence=float(parsed.get("confidence") or 0.6),
-            suggested_edit=str(parsed.get("suggested_edit") or "Требуется ручная юридическая проверка и редактирование."),
+            suggested_edit=str(
+                parsed.get("suggested_edit") or "Требуется ручная юридическая проверка и редактирование."
+            ),
             provider_used=provider_used,
             fallback_used=fallback_used,
             prompt_tokens=prompt_tokens,
@@ -155,12 +158,17 @@ class RiskLlmAnalyzer:
             {
                 "role": "system",
                 "content": (
-                    "Ты анализируешь анонимизированный юридический текст. "
+                    "Ты анализируешь анонимизированный юридический текст и evidence. "
                     "Верни строго JSON-объект без markdown и без дополнительных пояснений. "
-                    "Обязательные поля: title, summary, confidence, suggested_edit. "
+                    "Обязательные поля: title, summary, legal_basis, confidence, suggested_edit. "
                     "Пиши все значения полей на русском языке. "
+                    "summary должен содержать только вывод по риску без ссылок на статьи, нормы и источники. "
+                    "В summary обязательно явно укажи пункт или пункты договора, например: 'Пункт 4.2: ...'. "
+                    "legal_basis должен содержать только подтвержденное правовое обоснование из переданного evidence. "
+                    "legal_basis должен быть достаточно подробным: укажи подтверждающий фрагмент evidence и, если он есть в evidence, название источника или ссылку. "
+                    "Запрещено упоминать статьи, нормы, кодексы, судебные акты и источники, которых нет в evidence. "
+                    "Если evidence не содержит подтвержденного правового обоснования, верни legal_basis как пустую строку. "
                     "Учитывай только предоставленный текст и evidence. "
-                    "Если evidence недостаточно, все равно дай осторожную предварительную оценку. "
                     "summary должен быть кратким и конкретным. "
                     "suggested_edit должен содержать практичную формулировку правки на русском языке."
                 ),
@@ -204,6 +212,9 @@ class RiskLlmAnalyzer:
             if evidence
             else " Внешнее подтверждение не найдено, поэтому вывод предварительный."
         )
+        legal_basis = ""
+        if evidence:
+            legal_basis = f"Подтверждение следует уточнить по источникам: {', '.join(item.title for item in evidence[:2])}."
 
         return AnalysisDraft(
             title=RISK_TITLES.get(candidate.risk_type, "Юридический риск"),
@@ -211,6 +222,7 @@ class RiskLlmAnalyzer:
                 f"{RISK_SUMMARIES.get(candidate.risk_type, 'Обнаружена потенциально рискованная формулировка.')}"
                 f" Абзац содержит триггер: '{candidate.matched_text}'.{evidence_note}"
             ),
+            legal_basis=legal_basis,
             confidence=confidence,
             suggested_edit=self._suggested_edit_by_risk.get(
                 candidate.risk_type,

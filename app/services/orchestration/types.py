@@ -41,8 +41,10 @@ class Finding:
     source_excerpt: str | None
     title: str
     summary: str
+    legal_basis: str | None
     confidence: float
     suggested_edit: str
+    legal_basis_supported: bool = True
     evidence: list[EvidenceItem] = field(default_factory=list)
 
 

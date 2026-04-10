@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from dataclasses import asdict
 from datetime import UTC, datetime
 from pathlib import Path
@@ -34,6 +35,14 @@ logger = logging.getLogger(__name__)
 
 MIN_EVIDENCE_COUNT = 2
 MIN_RETRIEVAL_SCORE = 0.35
+LEGAL_BASIS_MARKERS = (
+    "ст.",
+    "статья",
+    "гк рф",
+    "постановление",
+    "обзор судебной практики",
+    "верховного суда",
+)
 
 
 class PipelineOrchestrator:
@@ -484,6 +493,121 @@ class PipelineOrchestrator:
                 analysis.cost_estimate,
             )
 
+        unsupported_citation_terms = self._unsupported_finding_citation_terms(analysis, selected_evidence)
+        legal_basis_supported = (
+            self._legal_basis_is_supported(analysis.legal_basis, selected_evidence)
+            and not unsupported_citation_terms
+        )
+        self._log_candidate_event(
+            session_id,
+            candidate.candidate_id,
+            "legal_basis_evaluated",
+            "system",
+            (
+                "Legal basis supported by evidence"
+                if legal_basis_supported
+                else "Legal basis not confirmed by evidence"
+            ),
+            observability,
+        )
+        logger.info(
+            "session_id=%s candidate_id=%s decision=legal_basis_evaluated supported=%s legal_basis=%s",
+            session_id,
+            candidate.candidate_id,
+            legal_basis_supported,
+            analysis.legal_basis or "<empty>",
+        )
+
+        if (analysis.legal_basis or unsupported_citation_terms) and not legal_basis_supported:
+            focus_terms = self._extract_legal_basis_focus_terms(analysis.legal_basis)
+            focus_terms.extend(unsupported_citation_terms)
+            focus_terms = list(dict.fromkeys(focus_terms))
+            legal_basis_query = self.query_builder.build_refined(
+                candidate=candidate,
+                jurisdiction=jurisdiction,
+                prior_query=selected_query.query,
+                evidence=selected_evidence,
+                focus_terms=focus_terms,
+            )
+            self._log_candidate_event(
+                session_id,
+                candidate.candidate_id,
+                "legal_basis_refine_decision",
+                "system",
+                "Legal basis unsupported; running targeted retrieval for supporting sources",
+                observability,
+            )
+            logger.info(
+                "session_id=%s candidate_id=%s decision=legal_basis_refine prior_query=%s refined_query=%s focus_terms=%s",
+                session_id,
+                candidate.candidate_id,
+                selected_query.query,
+                legal_basis_query.query,
+                ",".join(focus_terms) if focus_terms else "none",
+            )
+            legal_basis_result = self._run_retrieval_pass(
+                session_id=session_id,
+                candidate_id=candidate.candidate_id,
+                retrieval_request=legal_basis_query,
+                pass_index=3,
+                observability=observability,
+            )
+            if self._retrieval_quality_score(legal_basis_result.evidence, legal_basis_result.fallback_used) > self._retrieval_quality_score(
+                selected_evidence,
+                selected_result.fallback_used,
+            ):
+                selected_query = legal_basis_query
+                selected_result = legal_basis_result
+                selected_evidence = legal_basis_result.evidence
+                analysis = self.llm_analyzer.analyze(candidate, selected_evidence)
+                observability.llm_provider = analysis.provider_used
+                observability.llm_fallback_used = observability.llm_fallback_used or analysis.fallback_used
+                observability.llm_prompt_tokens += analysis.prompt_tokens
+                observability.llm_completion_tokens += analysis.completion_tokens
+                observability.llm_cost_estimate = round(
+                    observability.llm_cost_estimate + analysis.cost_estimate,
+                    6,
+                )
+                self._log_candidate_event(
+                    session_id,
+                    candidate.candidate_id,
+                    "llm_analysis",
+                    analysis.provider_used,
+                    "Re-analyzed candidate after legal basis retrieval refinement",
+                    observability,
+                )
+                logger.info(
+                    "session_id=%s candidate_id=%s llm_reanalysis_completed provider=%s prompt_tokens=%s completion_tokens=%s cost_estimate=%s",
+                    session_id,
+                    candidate.candidate_id,
+                    analysis.provider_used,
+                    analysis.prompt_tokens,
+                    analysis.completion_tokens,
+                    analysis.cost_estimate,
+                )
+                unsupported_citation_terms = self._unsupported_finding_citation_terms(analysis, selected_evidence)
+                legal_basis_supported = (
+                    self._legal_basis_is_supported(analysis.legal_basis, selected_evidence)
+                    and not unsupported_citation_terms
+                )
+
+        if (analysis.legal_basis or unsupported_citation_terms) and not legal_basis_supported:
+            degraded_flags.append("unsupported_legal_basis")
+            self._log_candidate_event(
+                session_id,
+                candidate.candidate_id,
+                "legal_basis_warning",
+                "system",
+                "Finding contains legal basis text that is not confirmed by current evidence",
+                observability,
+            )
+            logger.warning(
+                "session_id=%s candidate_id=%s legal_basis_unsupported legal_basis=%s",
+                session_id,
+                candidate.candidate_id,
+                analysis.legal_basis,
+            )
+
         self._log_candidate_event(
             session_id,
             candidate.candidate_id,
@@ -507,7 +631,9 @@ class PipelineOrchestrator:
             paragraph_id=candidate.paragraph_id,
             source_excerpt=candidate.paragraph_text,
             title=analysis.title,
-            summary=analysis.summary,
+            summary=self._summary_with_clause(candidate.paragraph_id, analysis.summary),
+            legal_basis=self._legal_basis_with_best_source(analysis.legal_basis, selected_evidence),
+            legal_basis_supported=legal_basis_supported,
             confidence=analysis.confidence,
             suggested_edit=f"[{analysis.provider_used}] {analysis.suggested_edit}",
             evidence=selected_evidence,
@@ -587,6 +713,115 @@ class PipelineOrchestrator:
         if not evidence:
             return 0.0
         return max(item.retrieval_score for item in evidence)
+
+    def _legal_basis_is_supported(self, legal_basis: str, evidence: list[EvidenceItem]) -> bool:
+        normalized = (legal_basis or "").strip().lower()
+        if not normalized:
+            return True
+
+        evidence_text = " ".join(
+            f"{item.title} {item.snippet} {item.uri}".lower()
+            for item in evidence
+        )
+        if not evidence_text:
+            return False
+
+        if any(marker in normalized for marker in LEGAL_BASIS_MARKERS):
+            citations = self._extract_citation_tokens(normalized)
+            if citations:
+                return all(self._citation_token_supported(token, evidence_text) for token in citations)
+            return any(marker in evidence_text for marker in LEGAL_BASIS_MARKERS if marker in normalized)
+
+        return True
+
+    def _summary_with_clause(self, paragraph_id: str, summary: str) -> str:
+        clean_summary = " ".join((summary or "").split())
+        if not clean_summary:
+            clean_summary = "Обнаружена потенциально рискованная формулировка."
+
+        clause_match = re.search(r"p\d+_(\d+)", paragraph_id or "")
+        clause = clause_match.group(1) if clause_match else paragraph_id
+        if not clause:
+            return clean_summary
+
+        clause_prefix = f"Пункт {clause}"
+        if clean_summary.lower().startswith(clause_prefix.lower()):
+            return clean_summary
+        return f"{clause_prefix}: {clean_summary}"
+
+    def _legal_basis_with_best_source(self, legal_basis: str, evidence: list[EvidenceItem]) -> str | None:
+        clean_basis = " ".join((legal_basis or "").split())
+        best_source = self._best_evidence_source(evidence)
+        if not clean_basis and not best_source:
+            return None
+        if not best_source:
+            return clean_basis or None
+
+        source_excerpt = self._trim_source_excerpt(best_source.snippet)
+        parts = []
+        if clean_basis:
+            parts.append(clean_basis)
+        if source_excerpt:
+            parts.append(f"Фрагмент источника: {source_excerpt}")
+        parts.append(f"Источник: {best_source.title} — {best_source.uri}")
+        return "\n".join(parts)
+
+    def _best_evidence_source(self, evidence: list[EvidenceItem]) -> EvidenceItem | None:
+        if not evidence:
+            return None
+        return max(evidence, key=lambda item: item.retrieval_score)
+
+    def _trim_source_excerpt(self, snippet: str, limit: int = 520) -> str:
+        clean_snippet = " ".join((snippet or "").split())
+        if len(clean_snippet) <= limit:
+            return clean_snippet
+        return clean_snippet[:limit].rstrip(" ,.;:") + "..."
+
+    def _unsupported_finding_citation_terms(self, analysis, evidence: list[EvidenceItem]) -> list[str]:
+        finding_text = " ".join(
+            [
+                analysis.title or "",
+                analysis.summary or "",
+                analysis.legal_basis or "",
+                analysis.suggested_edit or "",
+            ]
+        ).lower()
+        tokens = self._extract_citation_tokens(finding_text)
+        if not tokens:
+            return []
+
+        evidence_text = " ".join(
+            f"{item.title} {item.snippet} {item.uri}".lower()
+            for item in evidence
+        )
+        return [
+            token
+            for token in tokens
+            if not self._citation_token_supported(token, evidence_text)
+        ]
+
+    def _extract_citation_tokens(self, legal_basis: str) -> list[str]:
+        tokens = re.findall(r"(ст\.?\s*\d+(?:\.\d+)?)", legal_basis)
+        if "гк рф" in legal_basis:
+            tokens.append("гк рф")
+        return list(dict.fromkeys(token.strip().lower() for token in tokens))
+
+    def _citation_token_supported(self, token: str, evidence_text: str) -> bool:
+        if token in evidence_text:
+            return True
+        article_match = re.search(r"ст\.?\s*(\d+(?:\.\d+)?)", token)
+        if article_match:
+            number = article_match.group(1)
+            return f"статья {number}" in evidence_text or f"ст. {number}" in evidence_text
+        return False
+
+    def _extract_legal_basis_focus_terms(self, legal_basis: str) -> list[str]:
+        focus_terms: list[str] = []
+        for token in self._extract_citation_tokens(legal_basis):
+            focus_terms.append(token)
+        if "скрыт" in legal_basis.lower():
+            focus_terms.append("скрытые недостатки товара")
+        return list(dict.fromkeys(term for term in focus_terms if term))
 
     def _evidence_is_sufficient(self, evidence: list[EvidenceItem], fallback_used: bool) -> bool:
         if fallback_used:

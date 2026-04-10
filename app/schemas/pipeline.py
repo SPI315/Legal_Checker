@@ -27,6 +27,8 @@ class FindingResponse(BaseModel):
     paragraph_id: str
     title: str
     summary: str
+    legal_basis: str | None = None
+    legal_basis_supported: bool = True
     confidence: float
     suggested_edit: str
     evidence: list[EvidenceResponse]

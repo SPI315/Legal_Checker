@@ -40,6 +40,12 @@ class DocxReportExporter:
     def _append_finding(self, doc: Document, finding: Finding) -> None:
         doc.add_heading(f"{finding.title} ({finding.paragraph_id})", level=3)
         doc.add_paragraph(f"Summary: {finding.summary}")
+        if finding.legal_basis:
+            legal_basis_paragraph = doc.add_paragraph()
+            legal_basis_paragraph.add_run("Legal basis: ").bold = True
+            legal_basis_paragraph.add_run(finding.legal_basis)
+        if not finding.legal_basis_supported:
+            doc.add_paragraph("Warning: legal basis is not confirmed by current evidence.")
         doc.add_paragraph(f"Confidence: {finding.confidence:.2f}")
         doc.add_paragraph(f"Suggested edit: {finding.suggested_edit}")
         if finding.evidence:

@@ -211,6 +211,8 @@ def test_llm_system_prompt_requires_russian_json_output() -> None:
 
     assert "Пиши все значения полей на русском языке" in messages[0]["content"]
     assert "JSON" in messages[0]["content"]
+    assert "legal_basis" in messages[0]["content"]
+    assert "Запрещено упоминать статьи" in messages[0]["content"]
 
 
 def test_query_builder_uses_llm_generated_query(monkeypatch) -> None:
