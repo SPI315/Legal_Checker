@@ -22,3 +22,9 @@ def test_get_document_ingestion_service_builds_service() -> None:
     service = get_document_ingestion_service(settings)
 
     assert service is not None
+
+
+def test_settings_exposes_allowed_domains_list() -> None:
+    settings = Settings(allowed_source_domains="a.example,b.example")
+
+    assert settings.allowed_source_domains_list == ["a.example", "b.example"]

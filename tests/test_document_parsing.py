@@ -45,6 +45,8 @@ def test_parse_pdf_text_only(monkeypatch) -> None:
     assert result.file_type == "pdf"
     assert len(result.paragraphs) == 2
     assert result.paragraphs[0].paragraph_id == "p1_1"
+    assert result.paragraphs[0].start_offset == 0
+    assert result.paragraphs[0].end_offset == len("Стр 1")
     assert "Стр 3" in result.full_text
 
 
@@ -74,3 +76,5 @@ def test_parse_docx_with_tables(monkeypatch) -> None:
     assert "Договор поставки" in result.full_text
     assert "Наименование | Цена" in result.full_text
     assert "Услуга А | 1000" in result.full_text
+    assert result.paragraphs[0].start_offset == 0
+    assert result.paragraphs[0].end_offset == len("Договор поставки")

@@ -14,7 +14,15 @@ class DummyDocumentService:
             file_name=file_name,
             file_type="pdf",
             full_text="parsed",
-            paragraphs=[DocumentParagraph(paragraph_id="p1_1", page=1, text="parsed")],
+            paragraphs=[
+                DocumentParagraph(
+                    paragraph_id="p1_1",
+                    page=1,
+                    start_offset=0,
+                    end_offset=6,
+                    text="parsed",
+                )
+            ],
         )
 
 
@@ -33,6 +41,8 @@ def test_document_parse_route_success() -> None:
     body = response.json()
     assert body["file_type"] == "pdf"
     assert body["full_text"] == "parsed"
+    assert body["paragraphs"][0]["start_offset"] == 0
+    assert body["paragraphs"][0]["end_offset"] == 6
 
 
 def test_document_parse_route_rejects_unsupported_extension() -> None:
@@ -63,3 +73,18 @@ def test_document_parse_route_rejects_empty_file() -> None:
 
     assert response.status_code == 400
     assert response.json()["detail"] == "Uploaded file is empty"
+
+
+def test_document_parse_route_rejects_invalid_mime_for_extension() -> None:
+    app.dependency_overrides[get_document_ingestion_service] = lambda: DummyDocumentService()
+    client = TestClient(app)
+
+    response = client.post(
+        "/api/document/parse",
+        files={"file": ("contract.pdf", b"%PDF-test", "text/plain")},
+    )
+
+    app.dependency_overrides.clear()
+
+    assert response.status_code == 400
+    assert "Unsupported MIME type" in response.json()["detail"]

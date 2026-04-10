@@ -4,6 +4,8 @@
 class ParsedParagraph(BaseModel):
     paragraph_id: str
     page: int
+    start_offset: int
+    end_offset: int
     text: str
 
 

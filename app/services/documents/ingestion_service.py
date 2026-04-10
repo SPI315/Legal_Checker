@@ -28,18 +28,24 @@ class DocumentIngestionService:
 
         doc = fitz.open(stream=content, filetype="pdf")
         paragraphs: list[DocumentParagraph] = []
+        current_offset = 0
 
         for page_idx in range(len(doc)):
             page = doc[page_idx]
             text = page.get_text("text").strip()
             if text:
+                start_offset = current_offset
+                end_offset = start_offset + len(text)
                 paragraphs.append(
                     DocumentParagraph(
                         paragraph_id=f"p{page_idx + 1}_1",
                         page=page_idx + 1,
+                        start_offset=start_offset,
+                        end_offset=end_offset,
                         text=text,
                     )
                 )
+                current_offset = end_offset + 2
 
         full_text = "\n\n".join(p.text for p in paragraphs)
         return DocumentParseResult(
@@ -55,13 +61,25 @@ class DocumentIngestionService:
         doc = Document(io.BytesIO(content))
         paragraphs: list[DocumentParagraph] = []
         idx = 0
+        current_offset = 0
 
         for para in doc.paragraphs:
             text = para.text.strip()
             if not text:
                 continue
             idx += 1
-            paragraphs.append(DocumentParagraph(paragraph_id=f"p{idx}", page=1, text=text))
+            start_offset = current_offset
+            end_offset = start_offset + len(text)
+            paragraphs.append(
+                DocumentParagraph(
+                    paragraph_id=f"p{idx}",
+                    page=1,
+                    start_offset=start_offset,
+                    end_offset=end_offset,
+                    text=text,
+                )
+            )
+            current_offset = end_offset + 2
 
         for table_idx, table in enumerate(doc.tables, start=1):
             for row_idx, row in enumerate(table.rows, start=1):
@@ -71,13 +89,18 @@ class DocumentIngestionService:
                     continue
                 row_text = " | ".join(cells)
                 idx += 1
+                start_offset = current_offset
+                end_offset = start_offset + len(row_text)
                 paragraphs.append(
                     DocumentParagraph(
                         paragraph_id=f"t{table_idx}_r{row_idx}",
                         page=1,
+                        start_offset=start_offset,
+                        end_offset=end_offset,
                         text=row_text,
                     )
                 )
+                current_offset = end_offset + 2
 
         full_text = "\n\n".join(p.text for p in paragraphs)
         return DocumentParseResult(
